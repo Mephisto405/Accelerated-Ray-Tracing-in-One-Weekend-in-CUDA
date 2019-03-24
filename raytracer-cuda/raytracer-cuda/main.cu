@@ -3,17 +3,19 @@
 #include <iostream>
 #include <fstream>
 #include <time.h>
+#include <float.h>
+#include <curand_kernel.h>
 #include "vec3.h"
 #include "ray.h"
-#include "hitable.h"
-#include "hitable_list.h"
-#include "float.h"
 #include "sphere.h"
+#include "hitable_list.h"
+#include "camera.h"
 
 using namespace std;
 
 // limited version of checkCudaErrors from helper_cuda.h in CUDA examples
 #define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
+#define SPP 100
 
 void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
 	if (result) {
@@ -47,33 +49,50 @@ __device__ vec3 renderPixel(const ray& r, hitable_list **d_world) {
 }
 
 __global__ void render(vec3 *fb, int max_x, int max_y,
-						vec3 origin, vec3 lower_left_corner, vec3 horizontal, vec3 vertical, 
-						hitable_list **d_world) {
+						camera **cam, 
+						hitable_list **d_world,
+						curandState *rand_state) {
 	int i = threadIdx.x + blockIdx.x * blockDim.x;
 	int j = threadIdx.y + blockIdx.y * blockDim.y;
 	if ((i >= max_x) || (j >= max_y)) return;
 	int pixel_index = j * max_x + i;
+	curandState local_rand_state = rand_state[pixel_index];
 
-	/// normalized uv coordinate
-	float u = float(i) / float(max_x);
-	float v = float(j) / float(max_y);
+	vec3 spec(0, 0, 0);
+	for (int s = 0; s < SPP; s++) {
+		/// normalized uv coordinate
+		float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
+		float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
+		ray r = (*cam)->get_ray(u, v);
+		spec += renderPixel(r, d_world);
+	}
 
-	ray r(origin, lower_left_corner + u*horizontal + v*vertical);
-	fb[pixel_index] = renderPixel(r, d_world);
+	fb[pixel_index] = spec / float(SPP);
 }
 
-__global__ void create_world(hitable **d_list, hitable_list **d_world) {
+__global__ void create_world(hitable **d_list, hitable_list **d_world, camera **d_camera) {
 	if (threadIdx.x == 0 && blockIdx.x == 0) {
 		*(d_list) = new sphere(vec3(0, 0, -1), 0.5); // d_list[0]
 		*(d_list + 1) = new sphere(vec3(0, -100.5, -1), 100);
 		*(d_world) = new hitable_list(d_list, 2);
+		*(d_camera) = new camera();
 	}
 }
 
-__global__ void free_world(hitable **d_list, hitable_list **d_world) {
+__global__ void free_world(hitable **d_list, hitable_list **d_world, camera **d_camera) {
 	delete d_list[0];
 	delete d_list[1];
 	delete d_world[0];
+	delete d_camera[0];
+}
+
+__global__ void camere_init(int max_x, int max_y, curandState *rand_state) {
+	int i = threadIdx.x + blockDim.x * blockIdx.x;
+	int j = threadIdx.y + blockDim.y * blockIdx.y;
+	if ((i >= max_x) || (j >= max_y))
+		return;
+	int pixel_index = j * max_x + i;
+	curand_init(1984, pixel_index, 0, &rand_state[pixel_index]);
 }
 
 int main() {
@@ -84,14 +103,12 @@ int main() {
 	int ny = 600;
 	int tx = 8;
 	int ty = 8;
-	vec3 lower_left_corner(-2.0, -1.0, -1.0);
-	vec3 horizontal(4.0, 0.0, 0.0);
-	vec3 vertical(0.0, 2.0, 0.0);
-	vec3 origin(0.0, 0.0, 0.0);
 	int num_pixels = nx*ny;
 	size_t fb_size = num_pixels*sizeof(vec3);
 	hitable **d_list; // list of hitable pointer
 	hitable_list **d_world;
+	curandState *d_rand_state;
+	camera **d_camera;
 
 	std::cerr << "Rendering a " << nx << "x" << ny << " image ";
 	std::cerr << "in " << tx << "x" << ty << " blocks.\n";
@@ -109,21 +126,28 @@ int main() {
 	*/
 	checkCudaErrors(cudaMalloc((void **)&d_list, 2 * sizeof(hitable *)));
 	checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable_list *)));
-	create_world<<<1, 1>>>(d_list, d_world);
+	checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
+	create_world << <1, 1 >> >(d_list, d_world, d_camera);
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());
 
-	clock_t start, stop;
-	start = clock();
+	/*
+	Camera Initiailizer
+	*/
+	dim3 blocks(nx / tx + 1, ny / ty + 1);
+	dim3 threads(tx, ty);
+	checkCudaErrors(cudaMalloc((void **)&d_rand_state, num_pixels * sizeof(curandState)));
+	camere_init << <blocks, threads >> >(nx, ny, d_rand_state);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
 
 	/*
 	Setting thread blocks and Run
 	*/
-	dim3 blocks(nx / tx + 1, ny / ty + 1);
-	dim3 threads(tx, ty);
-	render<<<blocks, threads>>>(fb, nx, ny, 
-		origin, lower_left_corner, horizontal, vertical,
-		d_world);
+	clock_t start, stop;
+	start = clock();
+
+	render<<<blocks, threads>>>(fb, nx, ny, d_camera, d_world, d_rand_state);
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());
 	stop = clock();
@@ -148,9 +172,12 @@ int main() {
 	file.close();
 
 	checkCudaErrors(cudaDeviceSynchronize());
-	free_world << <1, 1 >> >(d_list, d_world);
+	free_world << <1, 1 >> >(d_list, d_world, d_camera);
+	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaFree(d_list));
 	checkCudaErrors(cudaFree(d_world));
+	checkCudaErrors(cudaFree(d_camera));
+	checkCudaErrors(cudaFree(d_rand_state));
 	checkCudaErrors(cudaFree(fb));
 
 	cudaDeviceReset();

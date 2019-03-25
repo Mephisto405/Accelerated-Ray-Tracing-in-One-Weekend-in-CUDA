@@ -19,6 +19,7 @@ __device__ vec3 random_in_unit_sphere(curandState *local_rand_state) {
 class material {
 public:
 	__device__ virtual bool scatter(const ray& r_in, const hit_record& rec, vec3& attenuation, ray& scattered, curandState* local_rand_state) const = 0;
+	__device__ virtual bool is_emitter() const = 0;
 };
 
 class lambertian : public material {
@@ -29,6 +30,7 @@ public:
 		attenuation = albedo;
 		return true;
 	}
+	__device__ virtual bool is_emitter() const { return false; }
 private:
 	vec3 albedo;
 };
@@ -46,9 +48,41 @@ public:
 		attenuation = albedo;
 		return (dot(scattered.direction(), N) > 0.0f);
 	}
+	__device__ virtual bool is_emitter() const { return false; }
 private:
 	vec3 albedo;
 	float fuzz;
+};
+
+class emitter : public material {
+public:
+	__device__ emitter(const vec3& a) : albedo(a) {}
+	__device__ virtual bool scatter(const ray& r_in, const hit_record& rec, vec3& attenuation, ray& scattered, curandState* local_rand_state) const {
+		attenuation = albedo;
+		return false;
+	}
+	__device__ virtual bool is_emitter() const { return true; }
+private:
+	vec3 albedo;
+};
+
+class mirror : public material {
+public:
+	__device__ mirror(const vec3& a) : albedo(a) {}
+	__device__ virtual bool scatter(const ray& r_in, const hit_record& rec, vec3& attenuation, ray& scattered, curandState* local_rand_state) const {
+		vec3 R, V, N;
+
+		N = rec.normal;
+		V = unit_vector(r_in.direction());
+		R = V - 2.0f * dot(V, N) * N;
+
+		scattered = ray(rec.p, R);
+		attenuation = albedo;
+		return true;
+	}
+	__device__ virtual bool is_emitter() const { return false; }
+private:
+	vec3 albedo;
 };
 
 #endif // !MATERIAL_H

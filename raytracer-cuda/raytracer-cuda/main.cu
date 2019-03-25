@@ -11,13 +11,15 @@
 #include "hitable_list.h"
 #include "camera.h"
 #include "material.h"
+#include "algorithm"
 
 using namespace std;
 
 // limited version of checkCudaErrors from helper_cuda.h in CUDA examples
 #define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
-#define SPP 100
+#define SPP 1024
 #define MAX_DEPTH 64
+#define RR_DEPTH 16
 
 void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
 	if (result) {
@@ -31,31 +33,45 @@ void check_cuda(cudaError_t result, char const *const func, const char *const fi
 
 __device__ vec3 renderPixel(const ray& r, hitable_list **d_world, curandState *rand_state) {
 	vec3 throughput(1, 1, 1);
-	vec3 bsdfWeight;
+	vec3 value;
 	ray in = r;
 	ray out;
 	int depth = 0;
+	bool scattered = false;
 
 	while (depth <= MAX_DEPTH || MAX_DEPTH < 0) {
 		hit_record rec;
 
 		if (d_world[0]->hit(in, 0.001f, FLT_MAX, rec)) {
-			if (rec.mat_ptr->scatter(in, rec, bsdfWeight, out, rand_state)) {
-				throughput *= bsdfWeight;
+			if (rec.mat_ptr->scatter(in, rec, value, out, rand_state)) {
+				throughput *= value;
 				in = out;
+				scattered = true;
 			}
 			else {
-				return vec3(0, 0, 0);
+				if (rec.mat_ptr->is_emitter()) {
+					return throughput * value;
+				}
+				else {
+					return vec3(0, 0, 0);
+				}
 			}
 		}
 		else {
+			/// environment map(sky)
 			vec3 u = unit_vector(in.direction());
 			float w = 0.5f * (u.y() + 1.0f);
-			vec3 value = (1.0f - w) * vec3(1.0, 1.0, 1.0) + w * vec3(0.5, 0.7, 1.0);
-			return throughput * value;
+			value = (1.0f - w) * vec3(0.5, 0.7, 1.0) + w * vec3(0.5, 0.0, 1.0);
+			return throughput * value;;
 		}
 
-		depth++;
+		/// russian roullete
+		if (depth++ >= RR_DEPTH) {
+			float q = min(max(throughput.x(), max(throughput.y(), throughput.z())), 0.95f);
+			if (curand_uniform(rand_state) >= q)
+				return vec3(0, 0, 0);
+			throughput /= q;
+		}
 	}
 
 	return vec3(0, 0, 0); 
@@ -91,15 +107,23 @@ __global__ void render(vec3 *fb, int max_x, int max_y,
 
 __global__ void create_world(hitable **d_list, hitable_list **d_world, camera **d_camera) {
 	if (threadIdx.x == 0 && blockIdx.x == 0) {
+
 		d_list[0] = new sphere(vec3(0, 0, -1), 0.5,
 			new lambertian(vec3(0.8, 0.3, 0.3)));
+
 		d_list[1] = new sphere(vec3(0, -100.5, -1), 100,
 			new lambertian(vec3(0.8, 0.8, 0.0)));
+
 		d_list[2] = new sphere(vec3(1, 0, -1), 0.5,
-			new metal(vec3(0.8, 0.6, 0.2), 1.0));
+			new metal(vec3(0.8, 0.6, 0.2), 0.2));
+
 		d_list[3] = new sphere(vec3(-1, 0, -1), 0.5,
-			new metal(vec3(0.8, 0.8, 0.8), 0.3));
-		*d_world = new hitable_list(d_list, 4);
+			new mirror(vec3(0.8, 0.8, 0.8)));
+
+		d_list[4] = new sphere(vec3(0, 0, 1), 0.2,
+			new emitter(vec3(1, 1, 1)));
+
+		*d_world = new hitable_list(d_list, 5);
 		*d_camera = new camera();
 	}
 }
@@ -129,6 +153,7 @@ int main() {
 	int tx = 8;
 	int ty = 8;
 	int num_pixels = nx*ny;
+	int num_hitables = 5;
 	size_t fb_size = num_pixels*sizeof(vec3);
 	hitable **d_list; // list of hitable pointer
 	hitable_list **d_world;
@@ -142,6 +167,9 @@ int main() {
 	ofstream file;
 	file.open("image.ppm");
 
+	clock_t start, stop;
+	start = clock();
+
 	// allocate FB
 	vec3 *fb;
 	checkCudaErrors(cudaMallocManaged((void **)&fb, fb_size));
@@ -149,7 +177,7 @@ int main() {
 	/*
 	Scene Initializer
 	*/
-	checkCudaErrors(cudaMalloc((void **)&d_list, 2 * sizeof(hitable *)));
+	checkCudaErrors(cudaMalloc((void **)&d_list, num_hitables * sizeof(hitable *)));
 	checkCudaErrors(cudaMalloc((void **)&d_world, sizeof(hitable_list *)));
 	checkCudaErrors(cudaMalloc((void **)&d_camera, sizeof(camera *)));
 	create_world << <1, 1 >> >(d_list, d_world, d_camera);
@@ -169,9 +197,6 @@ int main() {
 	/*
 	Setting thread blocks and Run
 	*/
-	clock_t start, stop;
-	start = clock();
-
 	render<<<blocks, threads>>>(fb, nx, ny, d_camera, d_world, d_rand_state);
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());

@@ -1,8 +1,9 @@
+#ifndef VEC3_H
+#define VEC3_H
+
 #include <math.h>
 #include <stdlib.h>
 #include <iostream>
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
 
 class vec3  {
 public:
@@ -138,3 +139,5 @@ __host__ __device__ inline vec3& vec3::operator/=(const float t) {
 __host__ __device__ inline vec3 unit_vector(vec3 v) {
 	return v / v.length();
 }
+
+#endif

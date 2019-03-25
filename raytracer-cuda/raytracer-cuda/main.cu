@@ -10,12 +10,14 @@
 #include "sphere.h"
 #include "hitable_list.h"
 #include "camera.h"
+#include "material.h"
 
 using namespace std;
 
 // limited version of checkCudaErrors from helper_cuda.h in CUDA examples
 #define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__ )
 #define SPP 100
+#define MAX_DEPTH 64
 
 void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
 	if (result) {
@@ -27,25 +29,36 @@ void check_cuda(cudaError_t result, char const *const func, const char *const fi
 	}
 }
 
-__device__ vec3 renderPixel(const ray& r, hitable_list **d_world) {
-	float w, tmin, tmax;
-	vec3 u, N;
-	hit_record rec;
-	bool hit;
+__device__ vec3 renderPixel(const ray& r, hitable_list **d_world, curandState *rand_state) {
+	vec3 throughput(1, 1, 1);
+	vec3 bsdfWeight;
+	ray in = r;
+	ray out;
+	int depth = 0;
 
-	tmin = 0.0f;
-	tmax = FLT_MAX;
+	while (depth <= MAX_DEPTH || MAX_DEPTH < 0) {
+		hit_record rec;
 
-	hit = d_world[0]->hit(r, tmin, tmax, rec);
+		if (d_world[0]->hit(in, 0.001f, FLT_MAX, rec)) {
+			if (rec.mat_ptr->scatter(in, rec, bsdfWeight, out, rand_state)) {
+				throughput *= bsdfWeight;
+				in = out;
+			}
+			else {
+				return vec3(0, 0, 0);
+			}
+		}
+		else {
+			vec3 u = unit_vector(in.direction());
+			float w = 0.5f * (u.y() + 1.0f);
+			vec3 value = (1.0f - w) * vec3(1.0, 1.0, 1.0) + w * vec3(0.5, 0.7, 1.0);
+			return throughput * value;
+		}
 
-	if (hit) {
-		return 0.5f * (rec.normal + vec3(1, 1, 1));
+		depth++;
 	}
-	else {
-		u = unit_vector(r.direction());
-		w = 0.5f * (u.y() + 1.0f);
-		return (1.0f - w) * vec3(1.0, 1.0, 1.0) + w * vec3(0.5, 0.7, 1.0);
-	}
+
+	return vec3(0, 0, 0); 
 }
 
 __global__ void render(vec3 *fb, int max_x, int max_y,
@@ -64,18 +77,30 @@ __global__ void render(vec3 *fb, int max_x, int max_y,
 		float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
 		float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
 		ray r = (*cam)->get_ray(u, v);
-		spec += renderPixel(r, d_world);
+		spec += renderPixel(r, d_world, &local_rand_state);
 	}
+	rand_state[pixel_index] = local_rand_state;
 
-	fb[pixel_index] = spec / float(SPP);
+	/// gamma correction
+	spec /= float(SPP);
+	spec[0] = sqrt(spec[0]);
+	spec[1] = sqrt(spec[1]);
+	spec[2] = sqrt(spec[2]);
+	fb[pixel_index] = spec;
 }
 
 __global__ void create_world(hitable **d_list, hitable_list **d_world, camera **d_camera) {
 	if (threadIdx.x == 0 && blockIdx.x == 0) {
-		*(d_list) = new sphere(vec3(0, 0, -1), 0.5); // d_list[0]
-		*(d_list + 1) = new sphere(vec3(0, -100.5, -1), 100);
-		*(d_world) = new hitable_list(d_list, 2);
-		*(d_camera) = new camera();
+		d_list[0] = new sphere(vec3(0, 0, -1), 0.5,
+			new lambertian(vec3(0.8, 0.3, 0.3)));
+		d_list[1] = new sphere(vec3(0, -100.5, -1), 100,
+			new lambertian(vec3(0.8, 0.8, 0.0)));
+		d_list[2] = new sphere(vec3(1, 0, -1), 0.5,
+			new metal(vec3(0.8, 0.6, 0.2), 1.0));
+		d_list[3] = new sphere(vec3(-1, 0, -1), 0.5,
+			new metal(vec3(0.8, 0.8, 0.8), 0.3));
+		*d_world = new hitable_list(d_list, 4);
+		*d_camera = new camera();
 	}
 }
 

@@ -4,15 +4,17 @@
 #include "hitable.h"
 #include "ray.h"
 #include "vec3.h"
+#include "material.h"
 
 class sphere : public hitable {
 public:
 	__device__ sphere() {}
-	__device__ sphere(vec3 _center, float _radius) : center(_center), radius(_radius) {};
+	__device__ sphere(vec3 _center, float _radius, material *m) : center(_center), radius(_radius), mat_ptr(m) {};
 	__device__ virtual bool hit(const ray& r, float tmin, float tmax, hit_record& rec) const;
 private:
 	vec3 center;
 	float radius;
+	material *mat_ptr;
 };
 
 __device__
@@ -29,6 +31,7 @@ bool sphere::hit(const ray& r, float tmin, float tmax, hit_record& rec) const {
 			rec.t = temp;
 			rec.p = r.point_at_t(rec.t);
 			rec.normal = (rec.p - center) / radius;
+			rec.mat_ptr = mat_ptr;
 			return true;
 		}
 		temp = (-b + sqrt(discriminant)) / a;
@@ -36,6 +39,7 @@ bool sphere::hit(const ray& r, float tmin, float tmax, hit_record& rec) const {
 			rec.t = temp;
 			rec.p = r.point_at_t(rec.t);
 			rec.normal = (rec.p - center) / radius;
+			rec.mat_ptr = mat_ptr;
 			return true;
 		}
 	}
